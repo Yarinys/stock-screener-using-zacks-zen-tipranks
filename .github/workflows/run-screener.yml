@@ -6,15 +6,15 @@ on:
       top:
         description: "How many top results to keep"
         required: true
-        default: "20"
+        default: "50"
       zen_candidates:
         description: "How many preliminary candidates to query Zen for"
         required: true
-        default: "80"
+        default: "200"
       zen_delay:
         description: "Seconds between Zen requests"
         required: true
-        default: "180"
+        default: "60"
 
 jobs:
   run-screener:
