@@ -1,0 +1,57 @@
+name: Run Stock Screener
+
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: "How many top results to keep"
+        required: true
+        default: "20"
+      zen_candidates:
+        description: "How many preliminary candidates to query Zen for"
+        required: true
+        default: "80"
+      zen_delay:
+        description: "Seconds between Zen requests"
+        required: true
+        default: "180"
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run screener
+        run: |
+          python screener_better_zen.py \
+            --top "${{ github.event.inputs.top }}" \
+            --file tickers_check.txt \
+            --workers 10 \
+            --zen-top-candidates "${{ github.event.inputs.zen_candidates }}" \
+            --zen-workers 1 \
+            --zen-exchanges nasdaq,nyse \
+            --domain-delay www.wallstreetzen.com="${{ github.event.inputs.zen_delay }}" \
+            --zen-wait-full-retry-after
+
+      - name: Upload scores
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-screener-results
+          path: |
+            scores.csv
+            zen_needed.csv
