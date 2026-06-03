@@ -3,26 +3,56 @@ name: Run Stock Screener
 on:
   workflow_dispatch:
     inputs:
-      top:
-        description: "How many top results to keep"
+      script_file:
+        description: "Python script path in the repo"
         required: true
-        default: "50"
+        default: "screener_better_zen.py"
+
+      ticker_file:
+        description: "Ticker file path in the repo"
+        required: true
+        default: "tickers.txt"
+
+      top:
+        description: "How many final stocks to output"
+        required: true
+        default: "20"
+
+      workers:
+        description: "Workers for the fast first pass"
+        required: true
+        default: "10"
+
       zen_candidates:
         description: "How many preliminary candidates to query Zen for"
         required: true
-        default: "200"
+        default: "80"
+
+      zen_workers:
+        description: "Workers for Zen. Recommended: 1"
+        required: true
+        default: "1"
+
       zen_delay:
         description: "Seconds between Zen requests"
         required: true
-        default: "60"
+        default: "180"
+
+      zen_exchanges:
+        description: "Zen exchanges to try"
+        required: true
+        default: "nasdaq,nyse"
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
+    permissions:
+      contents: read
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -30,24 +60,50 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install curl_cffi beautifulsoup4 requests
+
+      - name: Show repo files
+        run: |
+          echo "Current directory:"
+          pwd
+          echo ""
+          echo "Files:"
+          find . -maxdepth 3 -type f | sort
+
+      - name: Validate input files
+        run: |
+          if [ ! -f "${{ github.event.inputs.script_file }}" ]; then
+            echo "ERROR: script file not found: ${{ github.event.inputs.script_file }}"
+            exit 1
+          fi
+
+          if [ ! -f "${{ github.event.inputs.ticker_file }}" ]; then
+            echo "ERROR: ticker file not found: ${{ github.event.inputs.ticker_file }}"
+            exit 1
+          fi
 
       - name: Run screener
         run: |
-          python screener_better_zen.py \
+          python "${{ github.event.inputs.script_file }}" \
             --top "${{ github.event.inputs.top }}" \
-            --file tickers_check.txt \
-            --workers 10 \
+            --file "${{ github.event.inputs.ticker_file }}" \
+            --workers "${{ github.event.inputs.workers }}" \
             --zen-top-candidates "${{ github.event.inputs.zen_candidates }}" \
-            --zen-workers 1 \
-            --zen-exchanges nasdaq,nyse \
+            --zen-workers "${{ github.event.inputs.zen_workers }}" \
+            --zen-exchanges "${{ github.event.inputs.zen_exchanges }}" \
             --domain-delay www.wallstreetzen.com="${{ github.event.inputs.zen_delay }}" \
             --zen-wait-full-retry-after
 
-      - name: Upload scores
+      - name: Show output files
+        if: always()
+        run: |
+          echo "Output CSV files:"
+          find . -maxdepth 3 -type f -name "*.csv" | sort || true
+
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -55,3 +111,5 @@ jobs:
           path: |
             scores.csv
             zen_needed.csv
+            *.csv
+          if-no-files-found: warn
