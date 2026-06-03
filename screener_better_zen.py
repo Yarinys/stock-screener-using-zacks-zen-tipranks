@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as html_lib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
@@ -161,6 +162,9 @@ REQUEST_LIMITER = DomainRateLimiter(default_delay=0.75, domain_delays=DEFAULT_DO
 REQUEST_RETRIES = 3
 REQUEST_BACKOFF = 2.0
 
+TIPRANKS_DEBUG = False
+TIPRANKS_DEBUG_DIR = Path("tipranks_debug")
+
 
 def parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
     """Parse Retry-After as either seconds or an HTTP date."""
@@ -223,6 +227,14 @@ def configure_request_policy(
     REQUEST_LIMITER = DomainRateLimiter(default_delay=request_delay, domain_delays=domain_delays)
     REQUEST_RETRIES = retries
     REQUEST_BACKOFF = backoff
+
+
+def configure_tipranks_debug(enabled: bool, output_dir: str) -> None:
+    """Configure optional saving of failed TipRanks HTML for debugging."""
+    global TIPRANKS_DEBUG, TIPRANKS_DEBUG_DIR
+    TIPRANKS_DEBUG = bool(enabled)
+    TIPRANKS_DEBUG_DIR = Path(output_dir)
+
 
 ZEN_LETTER_TO_RANK = {
     "A": 1,
@@ -496,35 +508,251 @@ def get_zen_rank(
         f"Try passing --exchange nasdaq/nyse/amex/otc.{detail}"
     )
 
-def get_tipranks_score(ticker: str) -> tuple[int, str]:
-    ticker_lower = ticker.lower()
-    url = f"https://www.tipranks.com/stocks/{ticker_lower}"
-    html = request_get(url).text
-    text = html_to_text(html)
+def normalize_tipranks_ticker_for_url(ticker: str) -> str:
+    """
+    Normalize common US ticker formats for TipRanks URLs.
 
-    idx = text.lower().find("stock smart score")
-    if idx != -1:
-        chunk = text[idx : idx + 800]
-        match = re.search(
-            r"Stock Smart Score\s*(10|[1-9])\b",
-            chunk,
-            flags=re.I,
-        )
+    Most normal tickers are unchanged except lowercasing. Class-share tickers are
+    kept with dots because TipRanks commonly uses URLs like /stocks/brk.b.
+    """
+    return ticker.upper().strip().lstrip("$").replace("/", ".").lower()
+
+
+def _score_from_any_value(value) -> Optional[int]:
+    """Return a valid TipRanks Smart Score integer if value looks like 1..10."""
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        if int(value) == value and 1 <= int(value) <= 10:
+            return int(value)
+        return None
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        match = re.fullmatch(r"10|[1-9]", cleaned)
         if match:
-            return int(match.group(1)), url
+            return int(cleaned)
 
-    # Fallbacks for embedded JSON/state data.
-    json_patterns = [
-        r'"smartScore"\s*:\s*"?(10|[1-9])"?',
-        r'"smart_score"\s*:\s*"?(10|[1-9])"?',
-        r'"score"\s*:\s*"?(10|[1-9])"?\s*,\s*"scoreText"',
+    return None
+
+
+def _walk_for_smart_score(obj) -> Optional[int]:
+    """
+    Recursively search decoded JSON for fields that clearly mean Smart Score.
+
+    This deliberately avoids accepting generic fields named just "score" unless
+    nearby keys mention Smart Score. That reduces false positives from unrelated
+    ratings, sentiment scores, analyst scores, chart scores, etc.
+    """
+    if isinstance(obj, dict):
+        # Direct clear key names.
+        for key, value in obj.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized_key in {
+                "smartscore",
+                "stocksmartscore",
+                "tiprankssmartscore",
+                "smartscorevalue",
+            }:
+                score = _score_from_any_value(value)
+                if score is not None:
+                    return score
+
+                if isinstance(value, dict):
+                    for inner_key in ("value", "score", "raw", "displayValue"):
+                        score = _score_from_any_value(value.get(inner_key))
+                        if score is not None:
+                            return score
+
+        # Contextual object: some pages represent sections as
+        # {"title": "Stock Smart Score", "value": 10}.
+        context_text = " ".join(
+            str(obj.get(key, "")) for key in (
+                "title",
+                "name",
+                "label",
+                "heading",
+                "description",
+                "type",
+                "dataType",
+            )
+        ).lower()
+        if "smart" in context_text and "score" in context_text:
+            for key in ("value", "score", "raw", "displayValue", "number"):
+                score = _score_from_any_value(obj.get(key))
+                if score is not None:
+                    return score
+
+        for value in obj.values():
+            score = _walk_for_smart_score(value)
+            if score is not None:
+                return score
+
+    elif isinstance(obj, list):
+        for item in obj:
+            score = _walk_for_smart_score(item)
+            if score is not None:
+                return score
+
+    return None
+
+
+def _json_loads_maybe(value: str):
+    value = html_lib.unescape(value.strip())
+    if not value:
+        return None
+
+    # Next.js sometimes embeds JSON directly, and sometimes as a quoted string.
+    for candidate in (value, value.strip("'\"")):
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    return None
+
+
+def _extract_script_json_objects(html: str) -> list:
+    """Extract parseable JSON objects from script tags."""
+    objects = []
+
+    for match in re.finditer(r"<script[^>]*>(.*?)</script>", html, flags=re.I | re.S):
+        body = match.group(1).strip()
+        if not body:
+            continue
+
+        # Normal JSON script or __NEXT_DATA__.
+        parsed = _json_loads_maybe(body)
+        if parsed is not None:
+            objects.append(parsed)
+            continue
+
+        # Some Next.js/app-router pages put JSON-like strings inside JS calls.
+        # We do not execute JS. We only look for quoted JSON arrays/objects.
+        for string_match in re.finditer(r"(['\"])(\{.*?\}|\[.*?\])\1", body, flags=re.S):
+            parsed = _json_loads_maybe(string_match.group(2))
+            if parsed is not None:
+                objects.append(parsed)
+
+    return objects
+
+
+def _extract_tipranks_score_from_regex_sources(html: str, visible_text: str) -> Optional[int]:
+    """
+    Parse TipRanks Smart Score from visible text and embedded page state.
+
+    Current TipRanks pages commonly render visible text like:
+      "Nvidia Stock Smart Score 10 Outperform"
+    This parser also handles JSON keys like "smartScore": 10.
+    """
+    sources = [
+        visible_text,
+        re.sub(r"\s+", " ", visible_text),
+        html,
+        html_lib.unescape(html),
     ]
-    for pattern in json_patterns:
-        match = re.search(pattern, html, flags=re.I)
-        if match:
-            return int(match.group(1)), url
 
-    raise RuntimeError(f"Could not find TipRanks Smart Score for {ticker}.")
+    # Try to unescape JS string fragments too. This can fail safely.
+    try:
+        sources.append(bytes(html, "utf-8").decode("unicode_escape", errors="ignore"))
+    except Exception:
+        pass
+
+    text_patterns = [
+        # Current visible page form: "Nvidia Stock Smart Score 10 Outperform"
+        r"\b(?:[A-Za-z0-9 .,&'’:\-/]+?\s+)?Stock\s+Smart\s+Score\s*(10|[1-9])\b",
+        # More generic but still anchored to Smart Score and the 1..10 scale.
+        r"\bSmart\s+Score\s*(?:rating|score)?\s*(10|[1-9])\s*(?:/|out\s+of)\s*10\b",
+        r"\bSmart\s+Score\b.{0,180}?\b(10|[1-9])\s*(?:/|out\s+of)\s*10\b",
+        # Sometimes the number is separated by a sentiment label.
+        r"\bStock\s+Smart\s+Score\b.{0,120}?\b(10|[1-9])\b\s*(?:Outperform|Neutral|Underperform)\b",
+    ]
+
+    json_key_patterns = [
+        r'(?:"|\\")smartScore(?:"|\\")\s*:\s*(?:"|\\")?(10|[1-9])(?:"|\\")?',
+        r'(?:"|\\")smart_score(?:"|\\")\s*:\s*(?:"|\\")?(10|[1-9])(?:"|\\")?',
+        r'(?:"|\\")stockSmartScore(?:"|\\")\s*:\s*(?:"|\\")?(10|[1-9])(?:"|\\")?',
+        r'(?:"|\\")smartScoreValue(?:"|\\")\s*:\s*(?:"|\\")?(10|[1-9])(?:"|\\")?',
+        r'(?:"|\\")smartScore(?:"|\\")\s*:\s*\{[^{}]{0,300}?(?:"|\\")(?:value|score|displayValue)(?:"|\\")\s*:\s*(?:"|\\")?(10|[1-9])(?:"|\\")?',
+    ]
+
+    for source in sources:
+        for pattern in text_patterns:
+            match = re.search(pattern, source, flags=re.I | re.S)
+            if match:
+                return int(match.group(1))
+
+        for pattern in json_key_patterns:
+            match = re.search(pattern, source, flags=re.I | re.S)
+            if match:
+                return int(match.group(1))
+
+    return None
+
+
+def extract_tipranks_score_from_html(html: str, ticker: str) -> Optional[int]:
+    """
+    Return TipRanks Smart Score from a TipRanks stock page, or None if the
+    response is not a usable stock page / the score is not present.
+    """
+    visible_text = html_to_text(html)
+
+    score = _extract_tipranks_score_from_regex_sources(html, visible_text)
+    if score is not None:
+        return score
+
+    for obj in _extract_script_json_objects(html):
+        score = _walk_for_smart_score(obj)
+        if score is not None:
+            return score
+
+    return None
+
+
+def save_tipranks_debug_html(ticker: str, url: str, html: str, reason: str) -> None:
+    """Optionally save TipRanks HTML when parsing fails, useful on GitHub Actions."""
+    if not TIPRANKS_DEBUG:
+        return
+
+    try:
+        TIPRANKS_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_ticker = re.sub(r"[^A-Za-z0-9_.-]+", "_", ticker.upper())
+        html_path = TIPRANKS_DEBUG_DIR / f"{safe_ticker}.html"
+        meta_path = TIPRANKS_DEBUG_DIR / f"{safe_ticker}.txt"
+
+        html_path.write_text(html, encoding="utf-8", errors="ignore")
+        meta_path.write_text(
+            f"ticker={ticker.upper()}\nurl={url}\nreason={reason}\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"TIPRANKS DEBUG SAVE FAILED for {ticker}: {exc}", file=sys.stderr)
+
+
+def get_tipranks_score(ticker: str) -> tuple[int, str]:
+    ticker_url = normalize_tipranks_ticker_for_url(ticker)
+    url = f"https://www.tipranks.com/stocks/{ticker_url}"
+
+    response = request_get(url)
+    html = response.text
+
+    score = extract_tipranks_score_from_html(html, ticker)
+    if score is not None:
+        return score, url
+
+    visible_text = html_to_text(html)
+    short_visible = re.sub(r"\s+", " ", visible_text[:500]).strip()
+    reason = (
+        f"Could not find TipRanks Smart Score for {ticker}. "
+        f"HTTP {getattr(response, 'status_code', 'unknown')}. "
+        f"Visible page starts with: {short_visible!r}"
+    )
+    save_tipranks_debug_html(ticker, url, html, reason)
+    raise RuntimeError(reason)
 
 
 def compute_score(zacks_rank: int, zen_rank: int, tip_ranks: int) -> int:
@@ -645,7 +873,8 @@ def score_ticker(
 
     try:
         tipranks_score, tipranks_url = get_tipranks_score(ticker)
-    except Exception:
+    except Exception as exc:
+        print(f"TIPRANKS ERROR for {ticker}: {exc}", file=sys.stderr)
         tipranks_score, tipranks_url = None, None
         missing_sources.append("tipranks")
 
@@ -899,6 +1128,19 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--tipranks-debug",
+        action="store_true",
+        help=(
+            "Save failed TipRanks HTML pages to --tipranks-debug-dir. "
+            "Useful on GitHub Actions if TipRanks returns a different page."
+        ),
+    )
+    parser.add_argument(
+        "--tipranks-debug-dir",
+        default="tipranks_debug",
+        help="Directory for --tipranks-debug output. Default: tipranks_debug.",
+    )
+    parser.add_argument(
         "--retries",
         type=int,
         default=3,
@@ -988,6 +1230,10 @@ def main() -> int:
             domain_delay_items=args.domain_delay,
             retries=args.retries,
             backoff=args.backoff,
+        )
+        configure_tipranks_debug(
+            enabled=args.tipranks_debug,
+            output_dir=args.tipranks_debug_dir,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
