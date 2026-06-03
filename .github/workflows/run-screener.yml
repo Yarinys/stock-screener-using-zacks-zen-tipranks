@@ -43,6 +43,21 @@ on:
         required: true
         default: "nasdaq,nyse"
 
+      retries:
+        description: "HTTP retries"
+        required: true
+        default: "3"
+
+      backoff:
+        description: "Retry backoff multiplier"
+        required: true
+        default: "2"
+
+      progress_every:
+        description: "Print progress every N completed tickers"
+        required: true
+        default: "50"
+
 jobs:
   run-screener:
     runs-on: ubuntu-latest
@@ -95,13 +110,15 @@ jobs:
             --zen-workers "${{ github.event.inputs.zen_workers }}" \
             --zen-exchanges "${{ github.event.inputs.zen_exchanges }}" \
             --domain-delay www.wallstreetzen.com="${{ github.event.inputs.zen_delay }}" \
-            --zen-wait-full-retry-after
+            --retries "${{ github.event.inputs.retries }}" \
+            --backoff "${{ github.event.inputs.backoff }}" \
+            --progress-every "${{ github.event.inputs.progress_every }}"
 
       - name: Show output files
         if: always()
         run: |
           echo "Output CSV files:"
-          find . -maxdepth 3 -type f -name "*.csv" | sort || true
+          find . -maxdepth 4 -type f -name "*.csv" | sort || true
 
       - name: Upload results
         if: always()
@@ -111,5 +128,5 @@ jobs:
           path: |
             scores.csv
             zen_needed.csv
-            *.csv
+            **/*.csv
           if-no-files-found: warn
