@@ -22,7 +22,7 @@ on:
       zen_threshold:
         description: "Query Zen only if Zacks+TipRanks preliminary score is at least this"
         required: true
-        default: "19"
+        default: "7"
       output_file:
         description: "All-results CSV output path"
         required: true
@@ -46,11 +46,11 @@ on:
       zen_delay:
         description: "Minimum seconds between WallStreetZen requests"
         required: true
-        default: "80"
+        default: "3"
       request_delay:
         description: "Default minimum seconds between same-domain requests"
         required: true
-        default: "0.75"
+        default: "0.25"
       retries:
         description: "HTTP retries for transient/rate-limit failures"
         required: true
