@@ -1,0 +1,193 @@
+name: Run Threshold Screener
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_file:
+        description: "Threshold screener script path in the repo"
+        required: true
+        default: "screener_from_tipranks_cache_threshold.py"
+      ticker_file:
+        description: "Ticker file path in the repo"
+        required: true
+        default: "tickers.txt"
+      tipranks_cache:
+        description: "TipRanks cache CSV path in the repo"
+        required: true
+        default: "tipranks_cache.csv"
+      top:
+        description: "How many final fully-scored tickers to output"
+        required: true
+        default: "100"
+      zen_threshold:
+        description: "Query Zen only if Zacks+TipRanks preliminary score is at least this"
+        required: true
+        default: "19"
+      output_file:
+        description: "All-results CSV output path"
+        required: true
+        default: "scores.csv"
+      top_output_file:
+        description: "Top-results CSV output path"
+        required: true
+        default: "top_scores.csv"
+      limit:
+        description: "Optional: only process first N tickers. Leave empty for all."
+        required: false
+        default: ""
+      zen_exchanges:
+        description: "Zen exchanges to try"
+        required: true
+        default: "nasdaq,nyse"
+      exchange:
+        description: "Optional single Zen exchange. Leave empty to use zen_exchanges."
+        required: false
+        default: ""
+      zen_delay:
+        description: "Minimum seconds between WallStreetZen requests"
+        required: true
+        default: "80"
+      request_delay:
+        description: "Default minimum seconds between same-domain requests"
+        required: true
+        default: "0.75"
+      retries:
+        description: "HTTP retries for transient/rate-limit failures"
+        required: true
+        default: "1"
+      backoff:
+        description: "Base exponential backoff seconds"
+        required: true
+        default: "2"
+      progress_every:
+        description: "Print progress every N tickers"
+        required: true
+        default: "50"
+      skip_zen:
+        description: "Do not query Zen; useful for testing Zacks+TipRanks filter only"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi beautifulsoup4 requests
+
+      - name: Show repo files
+        run: |
+          echo "Current directory:"
+          pwd
+          echo ""
+          echo "Files:"
+          find . -maxdepth 3 -type f | sort
+
+      - name: Validate input files
+        run: |
+          if [ ! -f "${{ github.event.inputs.script_file }}" ]; then
+            echo "ERROR: script file not found: ${{ github.event.inputs.script_file }}"
+            exit 1
+          fi
+
+          if [ ! -f "${{ github.event.inputs.ticker_file }}" ]; then
+            echo "ERROR: ticker file not found: ${{ github.event.inputs.ticker_file }}"
+            exit 1
+          fi
+
+          if [ ! -f "${{ github.event.inputs.tipranks_cache }}" ]; then
+            echo "ERROR: TipRanks cache file not found: ${{ github.event.inputs.tipranks_cache }}"
+            echo "Run the Build TipRanks Cache workflow first, download the artifact, then commit tipranks_cache.csv to this repo."
+            exit 1
+          fi
+
+      - name: Run threshold screener
+        env:
+          SCRIPT_FILE: ${{ github.event.inputs.script_file }}
+          TICKER_FILE: ${{ github.event.inputs.ticker_file }}
+          TIPRANKS_CACHE: ${{ github.event.inputs.tipranks_cache }}
+          TOP: ${{ github.event.inputs.top }}
+          ZEN_THRESHOLD: ${{ github.event.inputs.zen_threshold }}
+          OUTPUT_FILE: ${{ github.event.inputs.output_file }}
+          TOP_OUTPUT_FILE: ${{ github.event.inputs.top_output_file }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          ZEN_EXCHANGES: ${{ github.event.inputs.zen_exchanges }}
+          EXCHANGE: ${{ github.event.inputs.exchange }}
+          ZEN_DELAY: ${{ github.event.inputs.zen_delay }}
+          REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          RETRIES: ${{ github.event.inputs.retries }}
+          BACKOFF: ${{ github.event.inputs.backoff }}
+          PROGRESS_EVERY: ${{ github.event.inputs.progress_every }}
+          SKIP_ZEN: ${{ github.event.inputs.skip_zen }}
+        run: |
+          set -e
+
+          cmd=(
+            python "$SCRIPT_FILE"
+            --file "$TICKER_FILE"
+            --tipranks-cache "$TIPRANKS_CACHE"
+            --top "$TOP"
+            --zen-threshold "$ZEN_THRESHOLD"
+            --output "$OUTPUT_FILE"
+            --top-output "$TOP_OUTPUT_FILE"
+            --zen-exchanges "$ZEN_EXCHANGES"
+            --request-delay "$REQUEST_DELAY"
+            --domain-delay "www.wallstreetzen.com=$ZEN_DELAY"
+            --retries "$RETRIES"
+            --backoff "$BACKOFF"
+            --progress-every "$PROGRESS_EVERY"
+          )
+
+          if [ -n "$LIMIT" ]; then
+            cmd+=(--limit "$LIMIT")
+          fi
+
+          if [ -n "$EXCHANGE" ]; then
+            cmd+=(--exchange "$EXCHANGE")
+          fi
+
+          if [ "$SKIP_ZEN" = "true" ]; then
+            cmd+=(--skip-zen)
+          fi
+
+          echo "Running: ${cmd[*]}"
+          "${cmd[@]}"
+
+      - name: Show output files
+        if: always()
+        run: |
+          echo "CSV files:"
+          find . -maxdepth 4 -type f -name "*.csv" -print -exec ls -lh {} \; | sort || true
+
+      - name: Upload screener results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: threshold-screener-results
+          path: |
+            ${{ github.event.inputs.output_file }}
+            ${{ github.event.inputs.top_output_file }}
+            *.csv
+          if-no-files-found: warn
