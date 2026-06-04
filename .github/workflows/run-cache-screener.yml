@@ -6,7 +6,7 @@ on:
       script_file:
         description: "Threshold screener script path in the repo"
         required: true
-        default: "screener_from_tipranks_cache_threshold.py"
+        default: "screener_tipranks_cache_needed.py"
       ticker_file:
         description: "Ticker file path in the repo"
         required: true
