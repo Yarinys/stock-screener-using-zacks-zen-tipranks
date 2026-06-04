@@ -15,7 +15,13 @@ Your full formula:
 
 perfect_count = I(zacks_rank=1) + I(zen_rank=1) + I(tip_ranks=10)
 
-score = 18 - 2*zacks_rank - 2*zen_rank + tip_ranks
+zacks_points = 2 * (6 - zacks_rank)
+zen_points   = 2 * (6 - zen_rank)
+
+score = -6
+        + zacks_points
+        + zen_points
+        + tip_ranks
         + I(zacks_rank=1)
         + I(zen_rank=1)
         + I(tip_ranks=10)
@@ -24,19 +30,24 @@ score = 18 - 2*zacks_rank - 2*zen_rank + tip_ranks
 
 Zen filtering rule in this script:
 
-zacks_tipranks_score = 18 - 2*zacks_rank + tip_ranks
+zacks_tipranks_score = -6
+                       + zacks_points
+                       + tip_ranks
                        + I(zacks_rank=1)
                        + I(tip_ranks=10)
                        + I(tip_ranks>=9)
+                       + 2*I(partial_perfect_count >= 2)
+
+where partial_perfect_count = I(zacks_rank=1) + I(tip_ranks=10).
 
 If zacks_tipranks_score >= --zen-threshold, query Zen.
-Default threshold: 19.
+Default threshold: 6.
 
 Install:
   pip install curl_cffi beautifulsoup4 requests
 
 Example:
-  python screener_from_tipranks_cache_threshold.py --top 100 --file tickers.txt --tipranks-cache tipranks_cache.csv --zen-threshold 19 --zen-exchanges nasdaq,nyse --domain-delay www.wallstreetzen.com=80
+  python screener_from_tipranks_cache_threshold.py --top 100 --file tickers.txt --tipranks-cache tipranks_cache.csv --zen-threshold 6 --zen-exchanges nasdaq,nyse --domain-delay www.wallstreetzen.com=80
 
 Outputs:
   scores.csv      -> all processed tickers
@@ -541,10 +552,12 @@ def parse_mode(items: list[str], file_arg: Optional[str]) -> list[str]:
 
 def compute_score(zacks_rank: int, zen_rank: int, tip_ranks: int) -> int:
     perfect_count = int(zacks_rank == 1) + int(zen_rank == 1) + int(tip_ranks == 10)
+    zacks_points = 2 * (6 - zacks_rank)
+    zen_points = 2 * (6 - zen_rank)
     return (
-        18
-        - 2 * zacks_rank
-        - 2 * zen_rank
+        -6
+        + zacks_points
+        + zen_points
         + tip_ranks
         + int(zacks_rank == 1)
         + int(zen_rank == 1)
@@ -557,15 +570,20 @@ def compute_score(zacks_rank: int, zen_rank: int, tip_ranks: int) -> int:
 def zacks_tipranks_score(zacks_rank: int, tip_ranks: int) -> int:
     """
     Preliminary score without Zen, used only to decide whether Zen is worth querying.
-    This is exactly: 18 - 2*zacks_rank + tip_ranks + Zacks/TipRanks bonuses.
+    This is exactly the new formula using only Zacks and TipRanks:
+      -6 + zacks_points + tip_ranks + Zacks/TipRanks bonuses,
+    where zacks_points = 2 * (6 - zacks_rank).
     """
+    partial_perfect_count = int(zacks_rank == 1) + int(tip_ranks == 10)
+    zacks_points = 2 * (6 - zacks_rank)
     return (
-        18
-        - 2 * zacks_rank
+        -6
+        + zacks_points
         + tip_ranks
         + int(zacks_rank == 1)
         + int(tip_ranks == 10)
         + int(tip_ranks >= 9)
+        + 2 * int(partial_perfect_count >= 2)
     )
 
 
@@ -757,8 +775,8 @@ def main() -> int:
     parser.add_argument(
         "--zen-threshold",
         type=float,
-        default=19.0,
-        help="Query Zen only when Zacks+TipRanks preliminary score is at least this. Default: 19.",
+        default=6.0,
+        help="Query Zen only when Zacks+TipRanks preliminary score is at least this. Default: 6.",
     )
     parser.add_argument("--output", default="scores.csv", help="All-results CSV path. Default: scores.csv")
     parser.add_argument("--top-output", default="top_scores.csv", help="Top full-score CSV path. Default: top_scores.csv")
