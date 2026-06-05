@@ -137,122 +137,78 @@ jobs:
           TIPRANKS_CACHE_INPUT: ${{ github.event.inputs.tipranks_cache_csv }}
         run: |
           set -e
-
+      
           python - <<'PY'
           import csv
-          import io
           import os
           import re
           import sys
-
+      
           raw = os.environ.get("TIPRANKS_CACHE_INPUT", "")
           github_env = os.environ["GITHUB_ENV"]
-
+      
           def write_env(path: str) -> None:
               with open(github_env, "a", encoding="utf-8") as f:
                   f.write(f"EFFECTIVE_TIPRANKS_CACHE={path}\n")
-
+      
           def strip_code_fence(text: str) -> str:
               text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-
+      
               if text.startswith("```"):
                   lines = text.splitlines()
-
+      
                   if lines and lines[0].strip().startswith("```"):
                       lines = lines[1:]
-
+      
                   if lines and lines[-1].strip().startswith("```"):
                       lines = lines[:-1]
-
+      
                   text = "\n".join(lines).strip()
-
+      
               return text
-
+      
           def parse_pasted_cache(text: str):
               text = strip_code_fence(text)
-
+      
               if not text.strip():
                   return []
-
-              try:
-                  sample = "\n".join(text.splitlines()[:10])
-                  dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
-              except Exception:
-                  dialect = csv.excel
-
-              rows = list(csv.reader(io.StringIO(text), dialect))
-              cleaned_rows = []
-
-              for row in rows:
-                  vals = [cell.strip() for cell in row if cell.strip()]
-
-                  # Allows lines like: AAPL 9
-                  if len(vals) == 1:
-                      vals = re.split(r"[\s,;\t]+", vals[0].strip())
-
-                  if len(vals) >= 2:
-                      cleaned_rows.append(vals)
-
-              if not cleaned_rows:
-                  return []
-
-              first = [x.strip().lower() for x in cleaned_rows[0]]
-
-              has_header = (
-                  any(x in {"ticker", "symbol"} for x in first)
-                  and any(x in {"rank", "score", "tipranks", "tipranks_score", "smart_score"} for x in first)
+      
+              # Robust parser:
+              # Finds ticker,score pairs even if GitHub collapses newlines into spaces.
+              # Examples it accepts:
+              #   AAPL,9
+              #   AAPL,9 MSFT,7 AVGO,10
+              #   ticker,rank AAPL,9 MSFT,7
+              pattern = re.compile(
+                  r"(?<![A-Za-z0-9.\-])"
+                  r"([A-Za-z][A-Za-z0-9.\-]{0,12})"
+                  r"\s*,\s*"
+                  r"(10|[1-9])"
+                  r"(?:\.0+)?"
+                  r"(?!\d)"
               )
-
-              ticker_col = 0
-              rank_col = 1
-              data_rows = cleaned_rows
-
-              if has_header:
-                  data_rows = cleaned_rows[1:]
-
-                  for i, name in enumerate(first):
-                      if name in {"ticker", "symbol"}:
-                          ticker_col = i
-                          break
-
-                  for i, name in enumerate(first):
-                      if name in {"rank", "score", "tipranks", "tipranks_score", "smart_score"}:
-                          rank_col = i
-                          break
-
+      
               parsed = []
-
-              for row in data_rows:
-                  if len(row) <= max(ticker_col, rank_col):
+      
+              for match in pattern.finditer(text):
+                  ticker = match.group(1).strip().upper()
+                  rank = int(match.group(2))
+      
+                  # Ignore accidental header-like matches, just in case.
+                  if ticker in {"TICKER", "SYMBOL"}:
                       continue
-
-                  ticker = row[ticker_col].strip().upper()
-                  rank_raw = row[rank_col].strip()
-
-                  if not ticker:
-                      continue
-
-                  try:
-                      rank = int(float(rank_raw))
-                  except ValueError:
-                      print(f"WARNING: skipping bad rank row: {row}")
-                      continue
-
-                  if not (1 <= rank <= 10):
-                      print(f"WARNING: skipping out-of-range TipRanks score row: {row}")
-                      continue
-
+      
                   parsed.append((ticker, rank))
-
-              # Deduplicate while keeping the last pasted value for each ticker.
+      
               deduped = {}
+      
               for ticker, rank in parsed:
                   deduped[ticker] = rank
-
+      
               return sorted(deduped.items())
-
+      
           raw = strip_code_fence(raw)
-
+      
           if not raw.strip():
               print("ERROR: tipranks_cache_csv input is empty.")
               print("Paste TipRanks data into the workflow input before running.")
@@ -261,27 +217,34 @@ jobs:
               print("AAPL,9")
               print("MSFT,7")
               sys.exit(1)
-
+      
           parsed = parse_pasted_cache(raw)
-
+      
           if not parsed:
               print("ERROR: pasted TipRanks cache input was provided, but no valid ticker/rank rows were found.")
               print("Expected examples:")
               print("ticker,rank")
               print("AAPL,9")
               print("MSFT,7")
+              print("")
+              print("Also accepted:")
+              print("AAPL,9 MSFT,7 AVGO,10")
               sys.exit(1)
-
+      
           output_path = "tipranks_cache_from_input.csv"
-
+      
           with open(output_path, "w", newline="", encoding="utf-8") as f:
               writer = csv.writer(f)
               writer.writerow(["ticker", "rank"])
               writer.writerows(parsed)
-
+      
           print("Using pasted TipRanks cache input.")
           print(f"Wrote {len(parsed)} rows to {output_path}.")
-
+          print("First 10 parsed rows:")
+      
+          for ticker, rank in parsed[:10]:
+              print(f"{ticker},{rank}")
+      
           write_env(output_path)
           PY
 
