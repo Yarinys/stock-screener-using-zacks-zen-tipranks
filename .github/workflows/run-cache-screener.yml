@@ -7,62 +7,77 @@ on:
         description: "Threshold screener script path in the repo"
         required: true
         default: "screener_tipranks_cache_needed.py"
+
       ticker_file:
         description: "Ticker file path in the repo"
         required: true
         default: "tickers.txt"
-      tipranks_cache:
-        description: "TipRanks cache CSV path in the repo"
+
+      tipranks_cache_csv:
+        description: "Paste TipRanks CSV here. Format: ticker,rank or ticker,score. Required."
         required: true
-        default: "tipranks_cache.csv"
+        default: ""
+
       top:
         description: "How many final fully-scored tickers to output"
         required: true
         default: "100"
+
       zen_threshold:
         description: "Query Zen only if Zacks+TipRanks preliminary score is at least this"
         required: true
         default: "7"
+
       output_file:
         description: "All-results CSV output path"
         required: true
         default: "scores.csv"
+
       top_output_file:
         description: "Top-results CSV output path"
         required: true
         default: "top_scores.csv"
+
       limit:
         description: "Optional: only process first N tickers. Leave empty for all."
         required: false
         default: ""
+
       zen_exchanges:
         description: "Zen exchanges to try"
         required: true
         default: "nasdaq,nyse"
+
       exchange:
         description: "Optional single Zen exchange. Leave empty to use zen_exchanges."
         required: false
         default: ""
+
       zen_delay:
         description: "Minimum seconds between WallStreetZen requests"
         required: true
-        default: "3"
+        default: "1"
+
       request_delay:
         description: "Default minimum seconds between same-domain requests"
         required: true
         default: "0.25"
+
       retries:
         description: "HTTP retries for transient/rate-limit failures"
         required: true
-        default: "1"
+        default: "5"
+
       backoff:
         description: "Base exponential backoff seconds"
         required: true
         default: "2"
+
       progress_every:
         description: "Print progress every N tickers"
         required: true
         default: "50"
+
       skip_zen:
         description: "Do not query Zen; useful for testing Zacks+TipRanks filter only"
         required: true
@@ -105,7 +120,7 @@ jobs:
           echo "Files:"
           find . -maxdepth 3 -type f | sort
 
-      - name: Validate input files
+      - name: Validate script and ticker file
         run: |
           if [ ! -f "${{ github.event.inputs.script_file }}" ]; then
             echo "ERROR: script file not found: ${{ github.event.inputs.script_file }}"
@@ -117,17 +132,163 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f "${{ github.event.inputs.tipranks_cache }}" ]; then
-            echo "ERROR: TipRanks cache file not found: ${{ github.event.inputs.tipranks_cache }}"
-            echo "Run the Build TipRanks Cache workflow first, download the artifact, then commit tipranks_cache.csv to this repo."
-            exit 1
-          fi
+      - name: Prepare TipRanks cache from pasted input
+        env:
+          TIPRANKS_CACHE_INPUT: ${{ github.event.inputs.tipranks_cache_csv }}
+        run: |
+          set -e
+
+          python - <<'PY'
+          import csv
+          import io
+          import os
+          import re
+          import sys
+
+          raw = os.environ.get("TIPRANKS_CACHE_INPUT", "")
+          github_env = os.environ["GITHUB_ENV"]
+
+          def write_env(path: str) -> None:
+              with open(github_env, "a", encoding="utf-8") as f:
+                  f.write(f"EFFECTIVE_TIPRANKS_CACHE={path}\n")
+
+          def strip_code_fence(text: str) -> str:
+              text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+              if text.startswith("```"):
+                  lines = text.splitlines()
+
+                  if lines and lines[0].strip().startswith("```"):
+                      lines = lines[1:]
+
+                  if lines and lines[-1].strip().startswith("```"):
+                      lines = lines[:-1]
+
+                  text = "\n".join(lines).strip()
+
+              return text
+
+          def parse_pasted_cache(text: str):
+              text = strip_code_fence(text)
+
+              if not text.strip():
+                  return []
+
+              try:
+                  sample = "\n".join(text.splitlines()[:10])
+                  dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+              except Exception:
+                  dialect = csv.excel
+
+              rows = list(csv.reader(io.StringIO(text), dialect))
+              cleaned_rows = []
+
+              for row in rows:
+                  vals = [cell.strip() for cell in row if cell.strip()]
+
+                  # Allows lines like: AAPL 9
+                  if len(vals) == 1:
+                      vals = re.split(r"[\s,;\t]+", vals[0].strip())
+
+                  if len(vals) >= 2:
+                      cleaned_rows.append(vals)
+
+              if not cleaned_rows:
+                  return []
+
+              first = [x.strip().lower() for x in cleaned_rows[0]]
+
+              has_header = (
+                  any(x in {"ticker", "symbol"} for x in first)
+                  and any(x in {"rank", "score", "tipranks", "tipranks_score", "smart_score"} for x in first)
+              )
+
+              ticker_col = 0
+              rank_col = 1
+              data_rows = cleaned_rows
+
+              if has_header:
+                  data_rows = cleaned_rows[1:]
+
+                  for i, name in enumerate(first):
+                      if name in {"ticker", "symbol"}:
+                          ticker_col = i
+                          break
+
+                  for i, name in enumerate(first):
+                      if name in {"rank", "score", "tipranks", "tipranks_score", "smart_score"}:
+                          rank_col = i
+                          break
+
+              parsed = []
+
+              for row in data_rows:
+                  if len(row) <= max(ticker_col, rank_col):
+                      continue
+
+                  ticker = row[ticker_col].strip().upper()
+                  rank_raw = row[rank_col].strip()
+
+                  if not ticker:
+                      continue
+
+                  try:
+                      rank = int(float(rank_raw))
+                  except ValueError:
+                      print(f"WARNING: skipping bad rank row: {row}")
+                      continue
+
+                  if not (1 <= rank <= 10):
+                      print(f"WARNING: skipping out-of-range TipRanks score row: {row}")
+                      continue
+
+                  parsed.append((ticker, rank))
+
+              # Deduplicate while keeping the last pasted value for each ticker.
+              deduped = {}
+              for ticker, rank in parsed:
+                  deduped[ticker] = rank
+
+              return sorted(deduped.items())
+
+          raw = strip_code_fence(raw)
+
+          if not raw.strip():
+              print("ERROR: tipranks_cache_csv input is empty.")
+              print("Paste TipRanks data into the workflow input before running.")
+              print("Expected format:")
+              print("ticker,rank")
+              print("AAPL,9")
+              print("MSFT,7")
+              sys.exit(1)
+
+          parsed = parse_pasted_cache(raw)
+
+          if not parsed:
+              print("ERROR: pasted TipRanks cache input was provided, but no valid ticker/rank rows were found.")
+              print("Expected examples:")
+              print("ticker,rank")
+              print("AAPL,9")
+              print("MSFT,7")
+              sys.exit(1)
+
+          output_path = "tipranks_cache_from_input.csv"
+
+          with open(output_path, "w", newline="", encoding="utf-8") as f:
+              writer = csv.writer(f)
+              writer.writerow(["ticker", "rank"])
+              writer.writerows(parsed)
+
+          print("Using pasted TipRanks cache input.")
+          print(f"Wrote {len(parsed)} rows to {output_path}.")
+
+          write_env(output_path)
+          PY
 
       - name: Run threshold screener
         env:
           SCRIPT_FILE: ${{ github.event.inputs.script_file }}
           TICKER_FILE: ${{ github.event.inputs.ticker_file }}
-          TIPRANKS_CACHE: ${{ github.event.inputs.tipranks_cache }}
           TOP: ${{ github.event.inputs.top }}
           ZEN_THRESHOLD: ${{ github.event.inputs.zen_threshold }}
           OUTPUT_FILE: ${{ github.event.inputs.output_file }}
@@ -144,10 +305,12 @@ jobs:
         run: |
           set -e
 
+          echo "Effective TipRanks cache: $EFFECTIVE_TIPRANKS_CACHE"
+
           cmd=(
             python "$SCRIPT_FILE"
             --file "$TICKER_FILE"
-            --tipranks-cache "$TIPRANKS_CACHE"
+            --tipranks-cache "$EFFECTIVE_TIPRANKS_CACHE"
             --top "$TOP"
             --zen-threshold "$ZEN_THRESHOLD"
             --output "$OUTPUT_FILE"
