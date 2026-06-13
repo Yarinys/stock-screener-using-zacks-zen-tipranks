@@ -26,7 +26,7 @@ on:
       zen_threshold:
         description: "Query Zen only if Zacks+TipRanks preliminary score is at least this"
         required: true
-        default: "7"
+        default: "9"
 
       output_file:
         description: "All-results CSV output path"
